@@ -657,6 +657,12 @@
     </div>
 
     <script>
+        // Быстрый доступ к DOM-элементам с кэшированием
+        const $ = (() => {
+            const cache = {};
+            return (id) => cache[id] || (cache[id] = document.getElementById(id));
+        })();
+
         // Скрытые поля для API
         const hiddenFields = {
             K: "PR",
@@ -695,6 +701,173 @@
             return parts.join('|');
         }
 
+        // Очистка QR-кода (изображение + placeholder)
+        function clearQr() {
+            const qrContainer = $('qrcode');
+            if (!qrContainer) return;
+            const existingImg = qrContainer.querySelector('img');
+            if (existingImg) {
+                existingImg.remove();
+            }
+            const placeholder = qrContainer.querySelector('.qr-placeholder');
+            if (placeholder) {
+                placeholder.style.display = 'block';
+            }
+        }
+
+        // Валидация обязательных полей и форматов
+        function validatePayload(jsonData) {
+            const errors = [];
+
+            const requiredFields = ['K', 'V', 'C', 'R', 'N', 'I', 'SF', 'S', 'RO'];
+            const missingFields = requiredFields.filter((f) => !jsonData[f]);
+            if (missingFields.length > 0) {
+                errors.push({ type: 'missing', fields: missingFields });
+            }
+
+            const amountPattern = /^RSD\d+,\d{2}$/;
+            if (!amountPattern.test(jsonData.I || '')) {
+                errors.push({ type: 'amount', value: jsonData.I });
+            }
+
+            if (jsonData.S && jsonData.S.length > 35) {
+                errors.push({ type: 'length', length: jsonData.S.length });
+            }
+
+            return errors;
+        }
+
+        // Формирование сообщений об ошибках валидации
+        function buildValidationMessages(errors, jsonData) {
+            const debugParts = [];
+            let userMessage = 'Ошибка валидации данных';
+
+            errors.forEach((err) => {
+                if (err.type === 'missing') {
+                    debugParts.push(
+                        `❌ Отсутствуют обязательные поля: ${err.fields.join(', ')}<br>` +
+                        `Детали:<br>` +
+                        err.fields.map(f => `- ${f}: "${jsonData[f]}" (пусто)`).join('<br>')
+                    );
+                    userMessage = `Поля ${err.fields.join(', ')} обязательны`;
+                }
+                if (err.type === 'amount') {
+                    debugParts.push(
+                        `❌ Неверный формат суммы: "${jsonData.I}"<br>` +
+                        `Ожидаемый формат: RSD{число},{две цифры}<br>` +
+                        `Пример: RSD1000,00`
+                    );
+                    userMessage = 'Неверный формат суммы. Используйте формат: число,две цифры (например, 1000,00)';
+                }
+                if (err.type === 'length') {
+                    debugParts.push(
+                        `❌ Поле S слишком длинное: ${err.length} символов<br>` +
+                        `Максимум: 35 символов<br>` +
+                        `Содержимое: "${jsonData.S}"`
+                    );
+                    userMessage = `Поле S слишком длинное. Максимум 35 символов, сейчас: ${err.length}`;
+                }
+            });
+
+            return { debugMessage: debugParts.join('<br><br>'), userMessage };
+        }
+
+        // Форматирование объекта для вывода в debug-блок
+        function formatDebugObject(obj) {
+            return Object.entries(obj)
+                .map(([k, v]) => `${k}: "${v}" (длина: ${v ? v.length : 0})`)
+                .join('<br>');
+        }
+
+        // Нормализация суммы: допускаем пробелы/точки как разделители тысяч, запятая как десятичный
+        function normalizeAmount(value) {
+            const raw = (value || '').trim();
+            if (!raw) return '';
+
+            // Убираем пробелы
+            let v = raw.replace(/\\s+/g, '');
+
+            // Если десятичный разделитель — точка, конвертируем в запятую
+            if (!v.includes(',') && /^\\d+\\.\\d{1,2}$/.test(v)) {
+                v = v.replace('.', ',');
+            } else {
+                // Иначе считаем точку разделителем тысяч
+                v = v.replace(/\\./g, '');
+            }
+
+            // Если нет запятой — добавляем копейки
+            if (!v.includes(',')) {
+                return v + ',00';
+            }
+
+            // Если есть запятая, нормализуем длину копеек
+            const parts = v.split(',');
+            const intPart = parts[0];
+            let fracPart = parts[1] || '';
+            if (fracPart.length === 0) fracPart = '00';
+            if (fracPart.length === 1) fracPart = fracPart + '0';
+            if (fracPart.length > 2) fracPart = fracPart.slice(0, 2);
+            return `${intPart},${fracPart}`;
+        }
+
+        // Формирование payload для API
+        function buildPayload(rawData) {
+            const normalizedAmount = normalizeAmount(rawData.I);
+            const jsonData = {
+                "K": hiddenFields.K,
+                "V": hiddenFields.V,
+                "C": hiddenFields.C,
+                "R": rawData.R.replace(/-/g, '').trim(),
+                "N": processTextField(rawData.N),
+                "I": "RSD" + normalizedAmount,
+                "SF": rawData.SF.trim(),
+                "S": processTextField(rawData.S),
+                "RO": rawData.RO.trim()
+            };
+
+            if (rawData.P && rawData.P.trim()) {
+                jsonData["P"] = processTextField(rawData.P);
+            }
+
+            return jsonData;
+        }
+
+        // Обновление счетчика символов для поля "S"
+        function updatePurposeCounter() {
+            const fieldS = $('fieldS');
+            const counter = $('fieldSCounter');
+            if (!fieldS || !counter) return;
+            const length = fieldS.value.length;
+            const maxLength = 35;
+            const remaining = maxLength - length;
+            counter.textContent = `Осталось: ${remaining}`;
+            counter.className = 'char-counter';
+            if (remaining < 0) {
+                counter.className = 'char-counter error';
+            } else if (remaining < 5) {
+                counter.className = 'char-counter warning';
+            }
+        }
+
+        // Безопасная загрузка сохраненных данных
+        function getSavedData() {
+            const saved = localStorage.getItem('paymentFormData');
+            if (!saved) return { currentType: null, types: {} };
+            try {
+                const parsed = JSON.parse(saved);
+                return {
+                    currentType: parsed.currentType || null,
+                    types: parsed.types || {}
+                };
+            } catch (e) {
+                return { currentType: null, types: {} };
+            }
+        }
+
+        function saveAllData(data) {
+            localStorage.setItem('paymentFormData', JSON.stringify(data));
+        }
+
         // Конфигурация для разных типов платежек
         const paymentTypes = {
             pio: {
@@ -727,33 +900,57 @@
             }
         };
 
-        // Функция для обновления полей при изменении типа платежки
-        function updatePaymentFields() {
-            const paymentType = document.getElementById('paymentType').value;
-            const config = paymentTypes[paymentType];
-            
-            // Сначала сохраняем текущие данные перед переключением
-            const currentData = getCurrentFormData();
-            const saved = localStorage.getItem('paymentFormData');
-            let allSavedData = { currentType: paymentType, types: {} };
-            if (saved) {
-                try {
-                    allSavedData = JSON.parse(saved);
-                    if (!allSavedData.types) allSavedData.types = {};
-                    if (!allSavedData.currentType) allSavedData.currentType = paymentType;
-                } catch (e) {
-                    allSavedData = { currentType: paymentType, types: {} };
-                }
+        function applyDefaultsForType(config) {
+            if (!config) return;
+            const purposeField = $('fieldS');
+            if (config.purposeTemplate) {
+                const date = getPreviousMonthYear();
+                purposeField.value = config.purposeTemplate.replace('{date}', date);
             }
-            
-            // Сохраняем текущие данные для предыдущего типа (если он был и отличается от текущего)
+
+            const recipientField = $('fieldN');
+            if (config.recipient) {
+                recipientField.value = config.recipient;
+            }
+
+            const accountField = $('fieldR');
+            accountField.value = config.account || '';
+
+            const amountField = $('fieldI');
+            if (config.defaultAmount) {
+                amountField.value = config.defaultAmount;
+            } else {
+                amountField.value = '0,00';
+            }
+        }
+
+        function prepareSavedData(paymentType, currentData) {
+            const allSavedData = getSavedData();
+            if (!allSavedData.types) allSavedData.types = {};
+
             const previousType = allSavedData.currentType;
             if (previousType && previousType !== paymentType && previousType in paymentTypes) {
                 allSavedData.types[previousType] = currentData;
             }
-            
-            // Обновляем текущий тип
+
             allSavedData.currentType = paymentType;
+            return allSavedData;
+        }
+
+        function persistTypeData(allSavedData, paymentType) {
+            allSavedData.currentType = paymentType;
+            allSavedData.types[paymentType] = getCurrentFormData();
+            saveAllData(allSavedData);
+        }
+
+        // Функция для обновления полей при изменении типа платежки
+        function updatePaymentFields() {
+            const paymentType = $('paymentType').value;
+            const config = paymentTypes[paymentType];
+            
+            // Сначала сохраняем текущие данные перед переключением
+            const currentData = getCurrentFormData();
+            const allSavedData = prepareSavedData(paymentType, currentData);
             
             // Проверяем, есть ли сохраненные данные для нового типа
             const savedTypeData = allSavedData.types && allSavedData.types[paymentType];
@@ -764,69 +961,23 @@
                     setFormDataForType(savedTypeData, true);
                 } else {
                     // Используем дефолтные значения из конфигурации
-                    // Обновляем назначение платежа с подстановкой даты
-                    const purposeField = document.getElementById('fieldS');
-                    if (config.purposeTemplate) {
-                        const date = getPreviousMonthYear();
-                        purposeField.value = config.purposeTemplate.replace('{date}', date);
-                    }
-                    
-                    // Обновляем получателя
-                    const recipientField = document.getElementById('fieldN');
-                    if (config.recipient) {
-                        recipientField.value = config.recipient;
-                    }
-                    
-                    // Обновляем счет получателя
-                    const accountField = document.getElementById('fieldR');
-                    accountField.value = config.account;
-                    
-                    // Обновляем сумму - ВСЕГДА устанавливаем дефолтную сумму
-                    const amountField = document.getElementById('fieldI');
-                    if (config.defaultAmount) {
-                        amountField.value = config.defaultAmount;
-                    } else {
-                        amountField.value = '0,00';
-                    }
+                    applyDefaultsForType(config);
                 }
                 
                 // Очищаем QR код при смене типа
-                const qrContainer = document.getElementById('qrcode');
-                const existingImg = qrContainer.querySelector('img');
-                if (existingImg) {
-                    existingImg.remove();
-                }
-                const placeholder = qrContainer.querySelector('.qr-placeholder');
-                if (placeholder) {
-                    placeholder.style.display = 'block';
-                }
+                clearQr();
                 
                 // Обновляем счетчик символов
-                const purposeField = document.getElementById('fieldS');
-                const counter = document.getElementById('fieldSCounter');
-                if (counter && purposeField) {
-                    const length = purposeField.value.length;
-                    const maxLength = 35;
-                    const remaining = maxLength - length;
-                    counter.textContent = `Осталось: ${remaining}`;
-                    counter.className = 'char-counter';
-                    if (remaining < 0) {
-                        counter.className = 'char-counter error';
-                    } else if (remaining < 5) {
-                        counter.className = 'char-counter warning';
-                    }
-                }
+                updatePurposeCounter();
                 
                 // Сохраняем данные для текущего типа в localStorage (после установки значений)
-                allSavedData.currentType = paymentType;
-                allSavedData.types[paymentType] = getCurrentFormData();
-                localStorage.setItem('paymentFormData', JSON.stringify(allSavedData));
+                persistTypeData(allSavedData, paymentType);
             }
         }
 
         // Функция для переключения на следующую платежку
         function nextPayment() {
-            const paymentTypeSelect = document.getElementById('paymentType');
+            const paymentTypeSelect = $('paymentType');
             const types = ['pio', 'zdro', 'nez', 'paus'];
             const currentIndex = types.indexOf(paymentTypeSelect.value);
             const nextIndex = (currentIndex + 1) % types.length;
@@ -837,29 +988,14 @@
 
         // Счетчик символов для поля S
         document.addEventListener('DOMContentLoaded', function() {
-            const fieldS = document.getElementById('fieldS');
-            const counter = document.getElementById('fieldSCounter');
+            const fieldS = $('fieldS');
             
-            function updateCounter() {
-                if (!fieldS || !counter) return;
-                const length = fieldS.value.length;
-                const maxLength = 35;
-                const remaining = maxLength - length;
-                counter.textContent = `Осталось: ${remaining}`;
-                counter.className = 'char-counter';
-                if (remaining < 0) {
-                    counter.className = 'char-counter error';
-                } else if (remaining < 5) {
-                    counter.className = 'char-counter warning';
-                }
-            }
-            
-            if (fieldS && counter) {
-                fieldS.addEventListener('input', updateCounter);
+            if (fieldS) {
+                fieldS.addEventListener('input', updatePurposeCounter);
             }
 
             // Обработчик изменения типа платежки
-            const paymentTypeSelect = document.getElementById('paymentType');
+            const paymentTypeSelect = $('paymentType');
             if (paymentTypeSelect) {
                 paymentTypeSelect.addEventListener('change', function() {
                     updatePaymentFields();
@@ -873,9 +1009,9 @@
             // Если нет сохраненных данных, устанавливаем дефолтные значения
             if (!hasSavedData) {
                 // Установка дефолтных значений
-                document.getElementById('fieldP').value = 'IVAN IVANOV';
-                document.getElementById('fieldSF').value = '253';
-                document.getElementById('fieldRO').value = '976222390000007106318';
+                $('fieldP').value = 'IVAN IVANOV';
+                $('fieldSF').value = '253';
+                $('fieldRO').value = '976222390000007106318';
                 
                 // Устанавливаем начальный тип платежки (ПИО)
                 paymentTypeSelect.value = 'pio';
@@ -883,12 +1019,12 @@
             }
             
             // Обновляем счетчик символов после установки значения
-            updateCounter();
+            updatePurposeCounter();
             
             // Добавляем автосохранение при изменении всех полей
             const fieldsToSave = ['fieldP', 'fieldN', 'fieldR', 'fieldSF', 'fieldI', 'fieldRO', 'fieldS', 'fieldModel'];
             fieldsToSave.forEach(fieldId => {
-                const field = document.getElementById(fieldId);
+                const field = $(fieldId);
                 if (field) {
                     field.addEventListener('input', saveToLocalStorage);
                     field.addEventListener('change', saveToLocalStorage);
@@ -898,8 +1034,8 @@
 
         // Функция для обновления дебаг информации
         function updateDebugInfo(message, type = 'info', jsonData = null) {
-            const debugInfo = document.getElementById('debugInfo');
-            const debugJson = document.getElementById('debugJson');
+            const debugInfo = $('debugInfo');
+            const debugJson = $('debugJson');
             
             debugInfo.className = 'debug-info';
             if (type === 'error') {
@@ -921,7 +1057,7 @@
         // Функция для переключения видимости дебаг секции
         function toggleDebug() {
             const debugSection = document.querySelector('.debug-section');
-            const debugBtn = document.getElementById('debugToggleBtn');
+            const debugBtn = $('debugToggleBtn');
             
             if (debugSection.style.display === 'none' || !debugSection.style.display) {
                 debugSection.style.display = 'block';
@@ -935,14 +1071,14 @@
         // Функция для получения всех значений полей формы для текущего типа
         function getCurrentFormData() {
             return {
-                fieldP: document.getElementById('fieldP').value,
-                fieldN: document.getElementById('fieldN').value,
-                fieldR: document.getElementById('fieldR').value,
-                fieldSF: document.getElementById('fieldSF').value,
-                fieldI: document.getElementById('fieldI').value,
-                fieldRO: document.getElementById('fieldRO').value,
-                fieldS: document.getElementById('fieldS').value,
-                fieldModel: document.getElementById('fieldModel').value
+                fieldP: $('fieldP').value,
+                fieldN: $('fieldN').value,
+                fieldR: $('fieldR').value,
+                fieldSF: $('fieldSF').value,
+                fieldI: $('fieldI').value,
+                fieldRO: $('fieldRO').value,
+                fieldS: $('fieldS').value,
+                fieldModel: $('fieldModel').value
             };
         }
 
@@ -968,7 +1104,7 @@
 
         // Функция для получения всех данных для всех типов платежек
         function getAllFormData() {
-            const currentType = document.getElementById('paymentType').value;
+            const currentType = $('paymentType').value;
             const allData = {
                 currentType: currentType,
                 types: {}
@@ -1007,30 +1143,17 @@
 
         // Функция для установки значений полей формы для конкретного типа
         function setFormDataForType(typeData, skipAutoGenerate = false) {
-            if (typeData.fieldP !== undefined) document.getElementById('fieldP').value = typeData.fieldP || '';
-            if (typeData.fieldN !== undefined) document.getElementById('fieldN').value = typeData.fieldN || '';
-            if (typeData.fieldR !== undefined) document.getElementById('fieldR').value = typeData.fieldR || '';
-            if (typeData.fieldSF !== undefined) document.getElementById('fieldSF').value = typeData.fieldSF || '';
-            if (typeData.fieldI !== undefined) document.getElementById('fieldI').value = typeData.fieldI || '';
-            if (typeData.fieldRO !== undefined) document.getElementById('fieldRO').value = typeData.fieldRO || '';
-            if (typeData.fieldS !== undefined) document.getElementById('fieldS').value = typeData.fieldS || '';
-            if (typeData.fieldModel !== undefined) document.getElementById('fieldModel').value = typeData.fieldModel || '';
+            if (typeData.fieldP !== undefined) $('fieldP').value = typeData.fieldP || '';
+            if (typeData.fieldN !== undefined) $('fieldN').value = typeData.fieldN || '';
+            if (typeData.fieldR !== undefined) $('fieldR').value = typeData.fieldR || '';
+            if (typeData.fieldSF !== undefined) $('fieldSF').value = typeData.fieldSF || '';
+            if (typeData.fieldI !== undefined) $('fieldI').value = typeData.fieldI || '';
+            if (typeData.fieldRO !== undefined) $('fieldRO').value = typeData.fieldRO || '';
+            if (typeData.fieldS !== undefined) $('fieldS').value = typeData.fieldS || '';
+            if (typeData.fieldModel !== undefined) $('fieldModel').value = typeData.fieldModel || '';
             
             // Обновляем счетчик символов
-            const purposeField = document.getElementById('fieldS');
-            const counter = document.getElementById('fieldSCounter');
-            if (counter && purposeField) {
-                const length = purposeField.value.length;
-                const maxLength = 35;
-                const remaining = maxLength - length;
-                counter.textContent = `Осталось: ${remaining}`;
-                counter.className = 'char-counter';
-                if (remaining < 0) {
-                    counter.className = 'char-counter error';
-                } else if (remaining < 5) {
-                    counter.className = 'char-counter warning';
-                }
-            }
+            updatePurposeCounter();
         }
 
         // Функция для установки всех значений для всех типов
@@ -1038,7 +1161,7 @@
             // Если старая структура (для обратной совместимости)
             if (data.paymentType && !data.types) {
                 if (data.paymentType) {
-                    document.getElementById('paymentType').value = data.paymentType;
+                    $('paymentType').value = data.paymentType;
                 }
                 setFormDataForType(data, skipAutoGenerate);
                 if (data.paymentType && !skipAutoGenerate) {
@@ -1049,12 +1172,12 @@
             
             // Новая структура с данными для всех типов
             if (data.currentType) {
-                document.getElementById('paymentType').value = data.currentType;
+                $('paymentType').value = data.currentType;
             }
             
             // Сохраняем данные для всех типов в localStorage
             if (data.types) {
-                const currentType = data.currentType || document.getElementById('paymentType').value;
+                const currentType = data.currentType || $('paymentType').value;
                 const currentData = data.types[currentType];
                 
                 if (currentData) {
@@ -1075,43 +1198,32 @@
 
         // Функция для сохранения в localStorage
         function saveToLocalStorage() {
-            const currentType = document.getElementById('paymentType').value;
+            const currentType = $('paymentType').value;
             const currentData = getCurrentFormData();
             
             // Загружаем существующие данные
-            const saved = localStorage.getItem('paymentFormData');
-            let allData = { currentType: currentType, types: {} };
-            if (saved) {
-                try {
-                    allData = JSON.parse(saved);
-                    if (!allData.types) allData.types = {};
-                } catch (e) {
-                    allData = { currentType: currentType, types: {} };
-                }
-            }
+            const allData = getSavedData();
+            if (!allData.types) allData.types = {};
             
             // Обновляем данные для текущего типа
             allData.currentType = currentType;
             allData.types[currentType] = currentData;
             
             // Сохраняем
-            localStorage.setItem('paymentFormData', JSON.stringify(allData));
+            saveAllData(allData);
         }
 
         // Функция для загрузки из localStorage
         function loadFromLocalStorage() {
-            const saved = localStorage.getItem('paymentFormData');
-            if (saved) {
-                try {
-                    const data = JSON.parse(saved);
-                    setAllFormData(data, true); // Пропускаем автоматическую генерацию
-                    return true;
-                } catch (e) {
-                    console.error('Ошибка при загрузке из localStorage:', e);
-                    return false;
-                }
+            const data = getSavedData();
+            if (!data || (!data.currentType && (!data.types || Object.keys(data.types).length === 0))) return false;
+            try {
+                setAllFormData(data, true); // Пропускаем автоматическую генерацию
+                return true;
+            } catch (e) {
+                console.error('Ошибка при загрузке из localStorage:', e);
+                return false;
             }
-            return false;
         }
 
         // Функция для сохранения в файл
@@ -1159,22 +1271,15 @@
 
         // Генерация и отправка QR кода
         window.generateQR = async function() {
-            const qrContainer = document.getElementById('qrcode');
-            const errorDiv = document.getElementById('error');
-            const generateBtn = document.getElementById('generateBtn');
+            const qrContainer = $('qrcode');
+            const errorDiv = $('error');
+            const generateBtn = $('generateBtn');
 
             // Очистка дебаг информации
             updateDebugInfo('🔄 Начинается генерация QR кода...', 'info');
 
             // Удаляем только изображение, оставляя placeholder
-            const existingImg = qrContainer.querySelector('img');
-            if (existingImg) {
-                existingImg.remove();
-            }
-            const placeholder = qrContainer.querySelector('.qr-placeholder');
-            if (placeholder) {
-                placeholder.style.display = 'block';
-            }
+            clearQr();
             errorDiv.textContent = '';
             errorDiv.className = 'error';
             generateBtn.disabled = true;
@@ -1185,80 +1290,27 @@
                 K: hiddenFields.K,
                 V: hiddenFields.V,
                 C: hiddenFields.C,
-                R: document.getElementById('fieldR').value,
-                N: document.getElementById('fieldN').value,
-                I: document.getElementById('fieldI').value,
-                SF: document.getElementById('fieldSF').value,
-                S: document.getElementById('fieldS').value,
-                RO: document.getElementById('fieldRO').value,
-                P: document.getElementById('fieldP').value
+                R: $('fieldR').value,
+                N: $('fieldN').value,
+                I: $('fieldI').value,
+                SF: $('fieldSF').value,
+                S: $('fieldS').value,
+                RO: $('fieldRO').value,
+                P: $('fieldP').value
             };
 
-            updateDebugInfo('📋 Сырые данные из формы:<br>' + 
-                Object.entries(rawData).map(([k, v]) => `${k}: "${v}" (длина: ${v ? v.length : 0})`).join('<br>'), 
-                'info', rawData);
+            updateDebugInfo('📋 Сырые данные из формы:<br>' + formatDebugObject(rawData), 'info', rawData);
 
-            const jsonData = {
-                "K": hiddenFields.K,
-                "V": hiddenFields.V,
-                "C": hiddenFields.C,
-                "R": rawData.R.replace(/-/g, '').trim(),
-                "N": processTextField(rawData.N),
-                "I": "RSD" + rawData.I.trim(),
-                "SF": rawData.SF.trim(),
-                "S": processTextField(rawData.S),
-                "RO": rawData.RO.trim()
-            };
-
-            // Добавляем поле P только если оно заполнено
-            if (rawData.P && rawData.P.trim()) {
-                jsonData["P"] = processTextField(rawData.P);
-            }
+            const jsonData = buildPayload(rawData);
 
             updateDebugInfo('✅ Данные обработаны и подготовлены к отправке', 'info', jsonData);
 
-            // Валидация обязательных полей
-            const requiredFields = ['K', 'V', 'C', 'R', 'N', 'I', 'SF', 'S', 'RO'];
-            const missingFields = [];
-            for (const field of requiredFields) {
-                if (!jsonData[field]) {
-                    missingFields.push(field);
-                }
-            }
-
-            if (missingFields.length > 0) {
-                const errorMsg = `❌ Отсутствуют обязательные поля: ${missingFields.join(', ')}<br>` +
-                    `Детали:<br>` +
-                    missingFields.map(f => `- ${f}: "${jsonData[f]}" (пусто)`).join('<br>');
-                updateDebugInfo(errorMsg, 'error', jsonData);
-                errorDiv.textContent = `Поля ${missingFields.join(', ')} обязательны`;
-                errorDiv.className = 'error show';
-                generateBtn.disabled = false;
-                generateBtn.textContent = 'Сгенерировать QR код';
-                return;
-            }
-
-            // Валидация формата суммы
-            const amountPattern = /^RSD\d+,\d{2}$/;
-            if (!amountPattern.test(jsonData.I)) {
-                const errorMsg = `❌ Неверный формат суммы: "${jsonData.I}"<br>` +
-                    `Ожидаемый формат: RSD{число},{две цифры}<br>` +
-                    `Пример: RSD1000,00`;
-                updateDebugInfo(errorMsg, 'error', jsonData);
-                errorDiv.textContent = 'Неверный формат суммы. Используйте формат: число,две цифры (например, 1000,00)';
-                errorDiv.className = 'error show';
-                generateBtn.disabled = false;
-                generateBtn.textContent = 'Сгенерировать QR код';
-                return;
-            }
-
-            // Валидация длины поля S
-            if (jsonData.S.length > 35) {
-                const errorMsg = `❌ Поле S слишком длинное: ${jsonData.S.length} символов<br>` +
-                    `Максимум: 35 символов<br>` +
-                    `Содержимое: "${jsonData.S}"`;
-                updateDebugInfo(errorMsg, 'error', jsonData);
-                errorDiv.textContent = `Поле S слишком длинное. Максимум 35 символов, сейчас: ${jsonData.S.length}`;
+            // Валидация
+            const errors = validatePayload(jsonData);
+            if (errors.length > 0) {
+                const { debugMessage, userMessage } = buildValidationMessages(errors, jsonData);
+                updateDebugInfo(debugMessage, 'error', jsonData);
+                errorDiv.textContent = userMessage;
                 errorDiv.className = 'error show';
                 generateBtn.disabled = false;
                 generateBtn.textContent = 'Сгенерировать QR код';
